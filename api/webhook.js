@@ -1,5 +1,9 @@
 const axios = require("axios");
+const { askClaude } = require("../lib/claude");
+
 const LARK_BASE = "https://open.larksuite.com/open-apis";
+const conversationHistory = {};
+const MAX_HISTORY = 10;
 
 async function getToken() {
   const r = await axios.post(LARK_BASE + "/auth/v3/tenant_access_token/internal", {
@@ -17,7 +21,7 @@ async function sendText(chatId, text) {
     { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) },
     { headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" } }
   );
-  console.log("sendText result:", JSON.stringify(r.data));
+  console.log("sendText result:", r.data.code, r.data.msg);
   return r.data;
 }
 
@@ -38,50 +42,82 @@ module.exports = async function handler(req, res) {
   try {
     const parsed = await getBody(req);
     body = parsed.body;
-    console.log("FULL BODY:", JSON.stringify(body).substring(0, 2000));
+    console.log("Event type:", body.header?.event_type || body.type || body.event?.type || "unknown");
   } catch (e) {
     console.error("Body parse error:", e.message);
     return res.status(400).json({ error: "Bad request" });
   }
 
   if (body.type === "url_verification") {
-    console.log("URL verification received");
     return res.status(200).json({ challenge: body.challenge });
   }
 
+  // Respond to Lark immediately (within 3s requirement)
   res.status(200).json({ code: 0 });
-
-  console.log("schema:", body.schema, "event_type:", body.header?.event_type, "v1_type:", body.event?.type);
 
   try {
     let chatId = null;
+    let userId = "unknown";
     let userText = null;
 
+    // Lark Events API v2
     if (body.schema === "2.0" && body.header?.event_type === "im.message.receive_v1") {
       const event = body.event;
       const msgType = event?.message?.message_type;
       chatId = event?.message?.chat_id;
-      console.log("v2 event | msgType:", msgType, "chatId:", chatId);
-      if (msgType === "text") {
-        try { userText = JSON.parse(event.message.content).text?.trim() || ""; }
-        catch { userText = event.message.content || ""; }
-        userText = userText.replace(/@\S+/g, "").trim();
+      userId = event?.sender?.sender_id?.open_id || "unknown";
+
+      if (msgType !== "text") {
+        await sendText(chatId, "Please send a text message.");
+        return;
       }
-    } else if (body.event?.type === "message") {
+
+      try { userText = JSON.parse(event.message.content).text?.trim() || ""; }
+      catch { userText = event.message.content || ""; }
+      userText = userText.replace(/@\S+/g, "").trim();
+    }
+    // Lark Events API v1 fallback
+    else if (body.event?.type === "message") {
       const evt = body.event;
       chatId = evt.open_chat_id || evt.chat_id;
-      userText = evt.text_without_at_bot || evt.text || "";
-      console.log("v1 event | chatId:", chatId, "text:", (userText || "").substring(0, 50));
+      userId = evt.open_id || evt.user_open_id || "unknown";
+      userText = (evt.text_without_at_bot || evt.text || "").trim();
     }
 
-    if (chatId && userText) {
-      const reply = "✅ Bot is working! You said: \"" + userText + "\"\n\nThis is a diagnostic reply (no Claude yet). Connection confirmed!";
-      await sendText(chatId, reply);
-      console.log("Diagnostic reply sent to chatId:", chatId);
-    } else {
-      console.log("No chatId or userText — chatId:", chatId, "userText:", userText);
+    if (!chatId || !userText) {
+      console.log("No chatId or userText, skipping. chatId:", chatId, "text:", userText);
+      return;
     }
+
+    // Maintain conversation history per user
+    if (!conversationHistory[userId]) conversationHistory[userId] = [];
+    const history = conversationHistory[userId];
+
+    console.log("Calling Claude for user", userId, "text:", userText.substring(0, 80));
+    const aiReply = await askClaude(userText, history);
+    console.log("Claude replied, length:", aiReply.length);
+
+    history.push({ role: "user", content: userText }, { role: "assistant", content: aiReply });
+    if (history.length > MAX_HISTORY * 2) {
+      conversationHistory[userId] = history.slice(-MAX_HISTORY * 2);
+    }
+
+    await sendText(chatId, aiReply);
+    console.log("Reply sent successfully");
   } catch (err) {
-    console.error("Handler error:", err.message, err.stack ? err.stack.substring(0, 500) : "");
+    console.error("Handler error:", err.message, err.stack ? err.stack.substring(0, 400) : "");
+    // Try to send an error message back to user
+    try {
+      const body2 = body;
+      const chatId2 = body2?.event?.message?.chat_id || body2?.event?.open_chat_id;
+      if (chatId2) {
+        const token = await getToken();
+        await axios.post(
+          LARK_BASE + "/im/v1/messages?receive_id_type=chat_id",
+          { receive_id: chatId2, msg_type: "text", content: JSON.stringify({ text: "Sorry, I encountered an error. Please try again." }) },
+          { headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" } }
+        );
+      }
+    } catch (e2) { console.error("Error sending error message:", e2.message); }
   }
 };

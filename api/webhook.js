@@ -46,10 +46,13 @@ function extractUrls(text) {
   return text.match(re) || [];
 }
 
-// Lark numeric types: 3=sheet, 8=bitable, 22=docx, 2=doc, 15=slide, 16=wiki
-function isSheetType(type) {
+// Lark numeric type codes for share_doc:
+// 2=old doc, 3=sheet, 8=bitable, 11=mindnote, 15=slide, 16=wiki, 22=docx
+function detectDocType(type) {
   const t = String(type);
-  return t === "3" || t === "8" || t === "sheet" || t === "bitable";
+  if (t === "3" || t === "8" || t === "sheet" || t === "bitable") return "sheet";
+  if (t === "16" || t === "wiki") return "wiki";
+  return "doc"; // default: 2, 22, etc.
 }
 
 function parseMessageContent(msgType, rawContent) {
@@ -76,9 +79,10 @@ function parseMessageContent(msgType, rawContent) {
     if (msgType === "share_doc" || msgType === "shared_doc") {
       const token = parsed.token || parsed.doc_token || parsed.wiki_token || parsed.spreadsheet_token || "";
       const title = parsed.title || "Document";
-      const type = parsed.type;
-      // Store full raw for debugging
-      return { text: title, urls: [], sharedToken: token, sharedTypeRaw: type, rawPayload: JSON.stringify(parsed) };
+      const typeRaw = parsed.type;
+      const docType = detectDocType(typeRaw);
+      console.log("[share_doc] token=" + token + " typeRaw=" + typeRaw + " docType=" + docType);
+      return { text: title, urls: [], sharedToken: token, docType, rawPayload: JSON.stringify(parsed) };
     }
   } catch (e) {
     console.error("parseMessageContent error:", e.message);
@@ -102,11 +106,11 @@ async function fetchDocContent(docToken) {
   try {
     const r = await axios.get(LARK_BASE + "/docx/v1/documents/" + docToken + "/raw_content",
       { headers: { Authorization: "Bearer " + token } });
-    if (r.data.code !== 0) throw new Error("code=" + r.data.code + " msg=" + r.data.msg);
+    if (r.data.code !== 0) throw new Error("code=" + r.data.code + ": " + r.data.msg);
     return r.data.data?.content || "";
   } catch (e) {
-    const body = e.response ? JSON.stringify(e.response.data).substring(0, 200) : e.message;
-    throw new Error("DocAPI HTTP" + (e.response?.status || "?") + ": " + body);
+    if (e.response) throw new Error("DocAPI HTTP" + e.response.status + ": " + JSON.stringify(e.response.data).substring(0, 200));
+    throw e;
   }
 }
 
@@ -118,62 +122,62 @@ async function fetchSheetContent(sheetToken) {
       LARK_BASE + "/sheets/v3/spreadsheets/" + sheetToken + "/sheets/query",
       { headers: { Authorization: "Bearer " + token } }
     );
-    if (meta.data.code !== 0) throw new Error("meta code=" + meta.data.code + " msg=" + meta.data.msg);
+    if (meta.data.code !== 0) throw new Error("meta code=" + meta.data.code + ": " + meta.data.msg);
     const sheets = meta.data.data?.sheets || [];
     if (sheets.length === 0) return "(Sheet trong - khong co du lieu)";
     const parts = [];
     for (const sheet of sheets.slice(0, 3)) {
-      // range WITHOUT encoding - Lark expects raw range in path
       const range = sheet.sheet_id + "!A1:Z100";
       try {
         const rv = await axios.get(
           LARK_BASE + "/sheets/v2/spreadsheets/" + sheetToken + "/values/" + range,
           { headers: { Authorization: "Bearer " + token } }
         );
-        if (rv.data.code !== 0) { console.log("[fetchSheet] val err code=" + rv.data.code); continue; }
+        if (rv.data.code !== 0) { console.log("[fetchSheet] val code=" + rv.data.code); continue; }
         const rows = rv.data.data?.valueRange?.values || [];
-        const text = rows.map((row) => (row || []).filter(c => c !== null && c !== "").join("\t")).join("\n");
+        const text = rows.map(row => (row || []).filter(c => c !== null && c !== "").join("\t")).join("\n");
         parts.push("=== " + sheet.title + " ===\n" + text);
       } catch (ve) {
-        const vb = ve.response ? "HTTP" + ve.response.status + " " + JSON.stringify(ve.response.data).substring(0,100) : ve.message;
-        console.error("[fetchSheet] val error:", vb);
-        parts.push("=== " + sheet.title + " === (loi doc: " + vb + ")");
+        const vb = ve.response ? "HTTP" + ve.response.status + ": " + JSON.stringify(ve.response.data).substring(0,100) : ve.message;
+        parts.push("=== " + sheet.title + " === (loi: " + vb + ")");
       }
     }
-    return parts.join("\n\n");
+    return parts.join("\n\n") || "(Sheet trong)";
   } catch (e) {
-    const body = e.response ? "HTTP" + e.response.status + " " + JSON.stringify(e.response.data).substring(0, 200) : e.message;
-    throw new Error("SheetAPI: " + body);
+    if (e.response) throw new Error("SheetAPI HTTP" + e.response.status + ": " + JSON.stringify(e.response.data).substring(0, 200));
+    throw e;
   }
 }
 
 async function fetchWikiContent(wikiToken) {
   const token = await getLarkToken();
+  console.log("[fetchWiki] token=" + wikiToken);
   try {
     const r = await axios.get(LARK_BASE + "/wiki/v2/spaces/get_node?token=" + wikiToken,
       { headers: { Authorization: "Bearer " + token } });
-    if (r.data.code !== 0) throw new Error("code=" + r.data.code + " msg=" + r.data.msg);
+    if (r.data.code !== 0) throw new Error("code=" + r.data.code + ": " + r.data.msg);
     const objToken = r.data.data?.node?.obj_token;
     const objType = r.data.data?.node?.obj_type;
+    console.log("[fetchWiki] obj_token=" + objToken + " obj_type=" + objType);
     if (!objToken) throw new Error("no obj_token in wiki node");
-    if (objType === "sheet") return fetchSheetContent(objToken);
+    if (objType === "sheet" || objType === "bitable") return fetchSheetContent(objToken);
     return fetchDocContent(objToken);
   } catch (e) {
-    const body = e.response ? "HTTP" + e.response.status + " " + JSON.stringify(e.response.data).substring(0, 200) : e.message;
-    throw new Error("WikiAPI: " + body);
+    if (e.response) throw new Error("WikiAPI HTTP" + e.response.status + ": " + JSON.stringify(e.response.data).substring(0, 200));
+    throw e;
   }
 }
 
 async function getDocContent(parsed) {
-  const { sharedToken, sharedTypeRaw, rawPayload, text, urls } = parsed;
+  const { sharedToken, docType, rawPayload, text, urls } = parsed;
   if (sharedToken) {
-    const useSheet = isSheetType(sharedTypeRaw);
-    console.log("[getDocContent] token=" + sharedToken + " typeRaw=" + sharedTypeRaw + " useSheet=" + useSheet);
+    console.log("[getDocContent] token=" + sharedToken + " docType=" + docType);
     try {
-      if (useSheet) return await fetchSheetContent(sharedToken);
+      if (docType === "sheet") return await fetchSheetContent(sharedToken);
+      if (docType === "wiki") return await fetchWikiContent(sharedToken);
       return await fetchDocContent(sharedToken);
     } catch (e) {
-      throw new Error("READ_ERR|token=" + sharedToken + "|type=" + sharedTypeRaw + "|raw=" + (rawPayload || "").substring(0,200) + "|err=" + e.message);
+      throw new Error("READ_ERR|token=" + sharedToken + "|type=" + docType + "|raw=" + (rawPayload||"").substring(0,150) + "|err=" + e.message);
     }
   }
   const resource = extractLarkResource(text, urls);
@@ -192,9 +196,9 @@ async function getDocContent(parsed) {
 async function askClaude(userMessage, history, docContent) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
-  let systemPrompt = "You are a helpful business assistant in Lark. Reply in the same language as the user (Vietnamese if they write Vietnamese).";
+  let systemPrompt = "You are a helpful business assistant in Lark. Reply in the same language as the user (Vietnamese if they write Vietnamese). Be concise and professional.";
   if (docContent) {
-    systemPrompt += "\n\nTai lieu/bang tinh duoc chia se:\n\n" + docContent + "\n\nDung thong tin nay de tra loi.";
+    systemPrompt += "\n\nNoi dung tai lieu/bang tinh duoc chia se:\n\n" + docContent + "\n\nDung thong tin nay de tra loi chinh xac.";
   }
   const messages = [...history, { role: "user", content: userMessage }];
   const r = await axios.post(ANTHROPIC_API,
@@ -232,8 +236,6 @@ module.exports = async function handler(req, res) {
     msgType = msg?.message_type || "text";
     rawContent = msg?.content;
 
-    console.log("[webhook] msgType=" + msgType + " chatType=" + chatType);
-
     if (chatType === "group") {
       const botMentioned = await isBotMentioned(msg?.mentions);
       if (!botMentioned) return res.status(200).json({ code: 0 });
@@ -262,13 +264,10 @@ module.exports = async function handler(req, res) {
       if (history.length > MAX_HISTORY * 2) conversationHistory[userId] = history.slice(-MAX_HISTORY * 2);
       await sendText(chatId, reply);
     } catch (err) {
-      // If it's a READ_ERR, send raw debug directly to user (no Claude filter)
       if (err.message.startsWith("READ_ERR|")) {
-        const parts = err.message.split("|");
-        const info = parts.map(p => p).join("\n");
-        await sendText(chatId, "[DEBUG - copy noi dung nay gui lai]\n" + info).catch(() => {});
+        await sendText(chatId, "[DEBUG]\n" + err.message.replace(/\|/g, "\n")).catch(() => {});
       } else {
-        const detail = err.response ? "HTTP " + err.response.status + ": " + JSON.stringify(err.response.data).substring(0, 200) : err.message;
+        const detail = err.response ? "HTTP" + err.response.status + ": " + JSON.stringify(err.response.data).substring(0,200) : err.message;
         await sendText(chatId, "Loi: " + detail).catch(() => {});
       }
     }
@@ -292,7 +291,7 @@ module.exports = async function handler(req, res) {
       if (history.length > MAX_HISTORY * 2) conversationHistory[userId] = history.slice(-MAX_HISTORY * 2);
       await sendText(chatId, reply);
     } catch (err) {
-      const detail = err.response ? "HTTP " + err.response.status + ": " + JSON.stringify(err.response.data).substring(0, 150) : err.message;
+      const detail = err.response ? "HTTP" + err.response.status + ": " + JSON.stringify(err.response.data).substring(0,150) : err.message;
       await sendText(chatId, "Loi: " + detail).catch(() => {});
     }
   }

@@ -3,7 +3,6 @@ const axios = require("axios");
 const LARK_BASE = "https://open.larksuite.com/open-apis";
 const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
 
-// In-memory dedup: ignore duplicate Lark events (retries)
 const processedIds = new Set();
 const conversationHistory = {};
 const MAX_HISTORY = 10;
@@ -29,14 +28,13 @@ async function sendText(chatId, text) {
 async function askClaude(userMessage, history) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
-
   const messages = [...history, { role: "user", content: userMessage }];
   const r = await axios.post(
     ANTHROPIC_API,
     {
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 512,
-      system: "You are a helpful business assistant in Lark. Be concise and practical. Reply in the same language as the user.",
+      max_tokens: 1024,
+      system: "You are a helpful business assistant in Lark. Be concise and professional. Reply in the same language as the user.",
       messages,
     },
     {
@@ -64,64 +62,71 @@ module.exports = async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   let body;
-  try {
-    body = await getBody(req);
-  } catch (e) {
-    return res.status(400).json({ error: "Bad request" });
-  }
+  try { body = await getBody(req); }
+  catch (e) { return res.status(400).json({ error: "Bad request" }); }
 
-  // URL verification
   if (body.type === "url_verification") {
     return res.status(200).json({ challenge: body.challenge });
   }
 
-  // Extract event data
   let chatId = null;
   let userId = "default";
   let userText = null;
   let messageId = null;
+  let chatType = "p2p";
 
   if (body.schema === "2.0" && body.header?.event_type === "im.message.receive_v1") {
     const evt = body.event;
-    chatId = evt?.message?.chat_id;
+    const msg = evt?.message;
+    chatId = msg?.chat_id;
     userId = evt?.sender?.sender_id?.open_id || "default";
-    messageId = evt?.message?.message_id;
-    const msgType = evt?.message?.message_type;
+    messageId = msg?.message_id;
+    chatType = msg?.chat_type || "p2p";
 
-    if (msgType !== "text") {
-      await sendText(chatId, "Please send a text message.");
+    if (msg?.message_type !== "text") {
+      if (chatType === "p2p") await sendText(chatId, "Vui lòng gửi tin nhắn văn bản.");
       return res.status(200).json({ code: 0 });
     }
 
-    try { userText = JSON.parse(evt.message.content).text?.trim() || ""; }
-    catch { userText = evt.message.content || ""; }
-    userText = userText.replace(/@\S+/g, "").trim();
+    // GROUP CHAT: only reply when @mentioned
+    if (chatType === "group") {
+      const mentions = msg?.mentions;
+      if (!mentions || mentions.length === 0) {
+        return res.status(200).json({ code: 0 });
+      }
+    }
+
+    try { userText = JSON.parse(msg.content).text?.trim() || ""; }
+    catch { userText = msg.content || ""; }
+    // Strip all @mentions from the text
+    userText = userText.replace(/@[^\s]+/g, "").trim();
 
   } else if (body.event?.type === "message") {
     const evt = body.event;
     chatId = evt.open_chat_id || evt.chat_id;
     userId = evt.open_id || "default";
     messageId = evt.message_id;
+    chatType = evt.chat_type || "p2p";
+
+    // GROUP CHAT v1: only reply when @mentioned
+    if (chatType === "group") {
+      const text = evt.text || "";
+      if (!text.includes("<at ")) {
+        return res.status(200).json({ code: 0 });
+      }
+    }
     userText = (evt.text_without_at_bot || evt.text || "").trim();
   }
 
-  if (!chatId || !userText) {
-    return res.status(200).json({ code: 0 });
-  }
+  if (!chatId || !userText) return res.status(200).json({ code: 0 });
 
-  // Deduplicate: if Lark retries the same event, ignore it
-  if (messageId && processedIds.has(messageId)) {
-    return res.status(200).json({ code: 0 });
-  }
+  // Dedup Lark retries
+  if (messageId && processedIds.has(messageId)) return res.status(200).json({ code: 0 });
   if (messageId) {
     processedIds.add(messageId);
-    if (processedIds.size > 500) {
-      const first = processedIds.values().next().value;
-      processedIds.delete(first);
-    }
+    if (processedIds.size > 500) processedIds.delete(processedIds.values().next().value);
   }
 
-  // Call Claude and send reply (synchronous — respond to Lark after)
   try {
     if (!conversationHistory[userId]) conversationHistory[userId] = [];
     const history = conversationHistory[userId];
@@ -136,9 +141,8 @@ module.exports = async function handler(req, res) {
     const detail = err.response
       ? "API " + err.response.status + ": " + JSON.stringify(err.response.data).substring(0, 150)
       : err.message;
-    try { await sendText(chatId, "\u26a0\ufe0f Error: " + detail); } catch (_) {}
+    try { await sendText(chatId, "\u26a0\ufe0f Lỗi: " + detail); } catch (_) {}
   }
 
-  // Respond to Lark last (after Claude completes)
   return res.status(200).json({ code: 0 });
 };

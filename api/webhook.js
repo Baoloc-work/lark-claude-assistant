@@ -7,19 +7,8 @@ const processedIds = new Set();
 const conversationHistory = {};
 const MAX_HISTORY = 10;
 
-// Detect Lark Doc/Sheet URL patterns
-function extractLarkResource(text) {
-  // Lark Doc: /docx/XXXX or /docs/XXXX
-  const docMatch = text.match(/(?:larksuite\.com|feishu\.cn)\/(?:docx|docs)\/([A-Za-z0-9]+)/);
-  if (docMatch) return { type: 'doc', id: docMatch[1] };
-  // Lark Sheet: /sheets/XXXX
-  const sheetMatch = text.match(/(?:larksuite\.com|feishu\.cn)\/(?:sheets|spreadsheets)\/([A-Za-z0-9]+)/);
-  if (sheetMatch) return { type: 'sheet', token: sheetMatch[1] };
-  // Short doc ID pattern (standalone token)
-  const tokenMatch = text.match(/\b([A-Za-z0-9]{16,}[A-Za-z0-9])\b/);
-  if (tokenMatch && text.toLowerCase().includes('doc')) return { type: 'doc', id: tokenMatch[1] };
-  return null;
-}
+// Cache bot's own open_id so we can check if it was @mentioned
+let BOT_OPEN_ID = null;
 
 async function getLarkToken() {
   const r = await axios.post(LARK_BASE + "/auth/v3/tenant_access_token/internal", {
@@ -30,35 +19,63 @@ async function getLarkToken() {
   return r.data.tenant_access_token;
 }
 
+async function getBotOpenId() {
+  if (BOT_OPEN_ID) return BOT_OPEN_ID;
+  try {
+    const token = await getLarkToken();
+    const r = await axios.get(LARK_BASE + "/bot/v3/info", {
+      headers: { Authorization: "Bearer " + token }
+    });
+    BOT_OPEN_ID = r.data.bot?.open_id || null;
+    console.log("Bot open_id:", BOT_OPEN_ID);
+  } catch (e) {
+    console.error("Could not fetch bot open_id:", e.message);
+  }
+  return BOT_OPEN_ID;
+}
+
+// Check if the bot itself was mentioned
+async function isBotMentioned(mentions) {
+  if (!mentions || mentions.length === 0) return false;
+  const botId = await getBotOpenId();
+  if (!botId) {
+    // Fallback: if we can't get bot ID, allow any mention (safer than blocking)
+    return mentions.length > 0;
+  }
+  return mentions.some(m => m.id?.open_id === botId || m.id?.user_id === process.env.LARK_APP_ID);
+}
+
+function extractLarkResource(text) {
+  const docMatch = text.match(/(?:larksuite\.com|feishu\.cn)\/(?:docx|docs)\/([A-Za-z0-9]+)/);
+  if (docMatch) return { type: 'doc', id: docMatch[1] };
+  const sheetMatch = text.match(/(?:larksuite\.com|feishu\.cn)\/(?:sheets|spreadsheets)\/([A-Za-z0-9]+)/);
+  if (sheetMatch) return { type: 'sheet', token: sheetMatch[1] };
+  return null;
+}
+
 async function fetchDocContent(docId) {
   const token = await getLarkToken();
-  const r = await axios.get(
-    LARK_BASE + "/docx/v1/documents/" + docId + "/raw_content",
-    { headers: { Authorization: "Bearer " + token }, timeout: 10000 }
-  );
+  const r = await axios.get(LARK_BASE + "/docx/v1/documents/" + docId + "/raw_content", {
+    headers: { Authorization: "Bearer " + token }, timeout: 10000
+  });
   if (r.data.code !== 0) throw new Error("Doc error: " + r.data.msg);
   return r.data.data?.content || "";
 }
 
 async function fetchSheetContent(sheetToken) {
   const token = await getLarkToken();
-  // Get sheet metadata first
-  const meta = await axios.get(
-    LARK_BASE + "/sheets/v3/spreadsheets/" + sheetToken,
-    { headers: { Authorization: "Bearer " + token }, timeout: 10000 }
-  );
-  if (meta.data.code !== 0) throw new Error("Sheet meta error: " + meta.data.msg);
-
+  const meta = await axios.get(LARK_BASE + "/sheets/v3/spreadsheets/" + sheetToken, {
+    headers: { Authorization: "Bearer " + token }, timeout: 10000
+  });
+  if (meta.data.code !== 0) throw new Error("Sheet error: " + meta.data.msg);
   const title = meta.data.data?.spreadsheet?.title || "Sheet";
-  // Get first sheet data (range A1:Z100)
   const sheetId = meta.data.data?.spreadsheet?.sheets?.[0]?.sheet_id || "0";
   const values = await axios.get(
     LARK_BASE + "/sheets/v2/spreadsheets/" + sheetToken + "/values/" + sheetId + "!A1:Z100",
     { headers: { Authorization: "Bearer " + token }, timeout: 10000 }
   );
   const rows = values.data.data?.valueRange?.values || [];
-  const content = rows.map(row => row.join("\t")).join("\n");
-  return title + "\n" + content;
+  return title + "\n" + rows.map(row => row.join("\t")).join("\n");
 }
 
 async function sendText(chatId, text) {
@@ -76,7 +93,7 @@ async function askClaude(userMessage, history, context) {
 
   let system = "You are a helpful business assistant in Lark. Be concise and professional. Reply in the same language as the user.";
   if (context) {
-    system += "\n\nThe user has shared a document. Here is its content:\n\n" + context.substring(0, 8000) + "\n\nAnswer their question based on this document.";
+    system += "\n\nThe user shared a document. Content:\n\n" + context.substring(0, 8000) + "\n\nAnswer based on this document.";
   }
 
   const messages = [...history, { role: "user", content: userMessage }];
@@ -127,9 +144,13 @@ module.exports = async function handler(req, res) {
       if (chatType === "p2p") await sendText(chatId, "Vui lòng gửi tin nhắn văn bản.");
       return res.status(200).json({ code: 0 });
     }
-    if (chatType === "group" && (!msg?.mentions || msg.mentions.length === 0)) {
-      return res.status(200).json({ code: 0 });
+
+    // Group chat: only reply when BOT is specifically @mentioned
+    if (chatType === "group") {
+      const botMentioned = await isBotMentioned(msg?.mentions);
+      if (!botMentioned) return res.status(200).json({ code: 0 });
     }
+
     try { userText = JSON.parse(msg.content).text?.trim() || ""; }
     catch { userText = msg.content || ""; }
     userText = userText.replace(/@\S+/g, "").trim();
@@ -155,25 +176,21 @@ module.exports = async function handler(req, res) {
     if (!conversationHistory[userId]) conversationHistory[userId] = [];
     const history = conversationHistory[userId];
 
-    // Check if user shared a Lark Doc or Sheet link
     let docContext = null;
     const resource = extractLarkResource(userText);
     if (resource) {
-      await sendText(chatId, "⏳ Đang đọc tài liệu, vui lòng chờ...");
+      await sendText(chatId, "⏳ Đang đọc tài liệu...");
       try {
-        if (resource.type === 'doc') {
-          docContext = await fetchDocContent(resource.id);
-        } else if (resource.type === 'sheet') {
-          docContext = await fetchSheetContent(resource.token);
-        }
+        docContext = resource.type === 'doc'
+          ? await fetchDocContent(resource.id)
+          : await fetchSheetContent(resource.token);
       } catch (fetchErr) {
-        await sendText(chatId, "⚠️ Không thể đọc tài liệu: " + fetchErr.message + "\n\nHãy đảm bảo bạn đã chia sẻ tài liệu với bot hoặc cho phép toàn tổ chức xem.");
+        await sendText(chatId, "⚠️ Không thể đọc tài liệu: " + fetchErr.message);
         return res.status(200).json({ code: 0 });
       }
     }
 
     const reply = await askClaude(userText, history, docContext);
-
     history.push({ role: "user", content: userText }, { role: "assistant", content: reply });
     if (history.length > MAX_HISTORY * 2) conversationHistory[userId] = history.slice(-MAX_HISTORY * 2);
 

@@ -48,6 +48,12 @@ function extractUrls(text) {
   return text.match(re) || [];
 }
 
+// Lark share_doc type codes:
+// 1=old doc, 2=old doc, 3=sheet, 8=bitable, 11=mindnote, 12=file, 15=slide, 16=wiki, 22=docx
+function isSheetType(type) {
+  return type === 3 || type === "3" || type === "sheet" || type === "bitable" || type === 8 || type === "8";
+}
+
 function parseMessageContent(msgType, rawContent) {
   try {
     const parsed = JSON.parse(rawContent);
@@ -71,10 +77,11 @@ function parseMessageContent(msgType, rawContent) {
       return { text: fullText.trim(), urls };
     }
     if (msgType === "share_doc" || msgType === "shared_doc") {
-      const token = parsed.token || parsed.doc_token || parsed.wiki_token;
+      const token = parsed.token || parsed.doc_token || parsed.wiki_token || parsed.spreadsheet_token;
       const title = parsed.title || "Document";
-      const type = parsed.type || "doc";
-      return { text: title, urls: [], sharedToken: token, sharedType: type };
+      const type = parsed.type; // could be number: 3=sheet, 22=doc, etc.
+      console.log("[share_doc] token=" + token + " type=" + type + " title=" + title);
+      return { text: title, urls: [], sharedToken: token, sharedType: type, sharedTypeRaw: type };
     }
   } catch (e) {
     console.error("parseMessageContent error:", e.message);
@@ -99,17 +106,18 @@ async function fetchDocContent(docToken) {
     LARK_BASE + "/docx/v1/documents/" + docToken + "/raw_content",
     { headers: { Authorization: "Bearer " + token } }
   );
-  if (r.data.code !== 0) throw new Error("Doc error " + r.data.code + ": " + r.data.msg);
+  if (r.data.code !== 0) throw new Error("Doc API code=" + r.data.code + " msg=" + r.data.msg);
   return r.data.data?.content || "";
 }
 
 async function fetchSheetContent(sheetToken) {
   const token = await getLarkToken();
+  console.log("[fetchSheet] token=" + sheetToken);
   const meta = await axios.get(
     LARK_BASE + "/sheets/v3/spreadsheets/" + sheetToken + "/sheets/query",
     { headers: { Authorization: "Bearer " + token } }
   );
-  if (meta.data.code !== 0) throw new Error("Sheet meta error: " + meta.data.msg);
+  if (meta.data.code !== 0) throw new Error("Sheet meta code=" + meta.data.code + " msg=" + meta.data.msg);
   const sheets = meta.data.data?.sheets || [];
   const parts = [];
   for (const sheet of sheets.slice(0, 3)) {
@@ -118,7 +126,10 @@ async function fetchSheetContent(sheetToken) {
       LARK_BASE + "/sheets/v2/spreadsheets/" + sheetToken + "/values/" + range,
       { headers: { Authorization: "Bearer " + token } }
     );
-    if (rv.data.code !== 0) continue;
+    if (rv.data.code !== 0) {
+      console.log("[fetchSheet] values error code=" + rv.data.code);
+      continue;
+    }
     const rows = rv.data.data?.valueRange?.values || [];
     const text = rows.map((row) => (row || []).join("\t")).join("\n");
     parts.push("--- Sheet: " + sheet.title + " ---\n" + text);
@@ -141,10 +152,12 @@ async function fetchWikiContent(wikiToken) {
 }
 
 async function getDocContext(parsed) {
-  const { text, urls, sharedToken, sharedType } = parsed;
+  const { text, urls, sharedToken, sharedTypeRaw } = parsed;
   if (sharedToken) {
     try {
-      if (sharedType === "sheet" || sharedType === "bitable") {
+      const useSheet = isSheetType(sharedTypeRaw);
+      console.log("[getDocContext] sharedToken=" + sharedToken + " typeRaw=" + sharedTypeRaw + " useSheet=" + useSheet);
+      if (useSheet) {
         const content = await fetchSheetContent(sharedToken);
         return "[Lark Sheet content]\n" + content;
       } else {
@@ -152,10 +165,12 @@ async function getDocContext(parsed) {
         return "[Lark Doc content]\n" + content;
       }
     } catch (e) {
-      if (e.message.includes("99991663") || e.message.includes("permission")) {
-        return "[Bot chua duoc cap quyen. Admin can duyet phien ban app moi trong Lark Developer Console.]";
+      console.error("[getDocContext] error:", e.message);
+      const code = e.message.match(/code=(\d+)/)?.[1];
+      if (code === "99991663" || e.message.includes("permission") || code === "1300002" || code === "1300003") {
+        return "[Loi quyen: Bot chua duoc cap quyen truy cap tai lieu. Ma loi: " + (code || e.message.substring(0,80)) + ". Admin can duyet phien ban app moi trong Lark Developer Console.]";
       }
-      return "[Loi doc tai lieu: " + e.message + "]";
+      return "[Loi doc tai lieu: " + e.message.substring(0, 200) + "]";
     }
   }
   const resource = extractLarkResource(text, urls);
@@ -172,10 +187,8 @@ async function getDocContext(parsed) {
         return "[Lark Doc content]\n" + content;
       }
     } catch (e) {
-      if (e.message.includes("99991663") || e.message.includes("permission")) {
-        return "[Bot chua duoc cap quyen. Admin can duyet phien ban app moi.]";
-      }
-      return "[Loi doc tai lieu: " + e.message + "]";
+      console.error("[getDocContext] URL resource error:", e.message);
+      return "[Loi doc tai lieu: " + e.message.substring(0, 200) + "]";
     }
   }
   return null;
@@ -184,9 +197,9 @@ async function getDocContext(parsed) {
 async function askClaude(userMessage, history, docContext) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
-  let systemPrompt = "You are a helpful business assistant integrated into Lark. Be concise and professional. Reply in the same language as the user.";
+  let systemPrompt = "You are a helpful business assistant integrated into Lark. Be concise and professional. Reply in the same language as the user (Vietnamese if they write Vietnamese).";
   if (docContext) {
-    systemPrompt += "\n\nThe user has shared a document/spreadsheet. Here is its content:\n\n" + docContext + "\n\nUse this content to answer their question accurately.";
+    systemPrompt += "\n\nThe user has shared a document/spreadsheet. Here is its content:\n\n" + docContext + "\n\nUse this content to answer their question accurately. If there is an error message in the content, tell the user exactly what the error says in Vietnamese.";
   }
   const messages = [...history, { role: "user", content: userMessage }];
   const r = await axios.post(
@@ -228,6 +241,8 @@ module.exports = async function handler(req, res) {
     msgType = msg?.message_type || "text";
     rawContent = msg?.content;
 
+    console.log("[webhook] msgType=" + msgType + " chatType=" + chatType);
+
     if (chatType === "group") {
       const botMentioned = await isBotMentioned(msg?.mentions);
       if (!botMentioned) return res.status(200).json({ code: 0 });
@@ -255,6 +270,7 @@ module.exports = async function handler(req, res) {
       if (history.length > MAX_HISTORY * 2) conversationHistory[userId] = history.slice(-MAX_HISTORY * 2);
       await sendText(chatId, reply);
     } catch (err) {
+      console.error("[webhook] error:", err.message);
       const detail = err.response ? "API " + err.response.status + ": " + JSON.stringify(err.response.data).substring(0, 150) : err.message;
       try { await sendText(chatId, "Loi: " + detail); } catch (_) {}
     }
@@ -278,6 +294,7 @@ module.exports = async function handler(req, res) {
       if (history.length > MAX_HISTORY * 2) conversationHistory[userId] = history.slice(-MAX_HISTORY * 2);
       await sendText(chatId, reply);
     } catch (err) {
+      console.error("[webhook] v1 error:", err.message);
       const detail = err.response ? "API " + err.response.status + ": " + JSON.stringify(err.response.data).substring(0, 150) : err.message;
       try { await sendText(chatId, "Loi: " + detail); } catch (_) {}
     }

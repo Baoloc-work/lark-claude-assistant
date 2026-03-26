@@ -46,13 +46,13 @@ function extractUrls(text) {
   return text.match(re) || [];
 }
 
-// Lark numeric type codes for share_doc:
-// 2=old doc, 3=sheet, 8=bitable, 11=mindnote, 15=slide, 16=wiki, 22=docx
+// Lark type codes: 2=old doc, 3=sheet, 8=bitable, 15=slide, 16=wiki, 22=docx
 function detectDocType(type) {
   const t = String(type);
-  if (t === "3" || t === "8" || t === "sheet" || t === "bitable") return "sheet";
+  if (t === "3" || t === "sheet") return "sheet";
+  if (t === "8" || t === "bitable") return "bitable";
   if (t === "16" || t === "wiki") return "wiki";
-  return "doc"; // default: 2, 22, etc.
+  return "doc";
 }
 
 function parseMessageContent(msgType, rawContent) {
@@ -109,12 +109,13 @@ async function fetchDocContent(docToken) {
     if (r.data.code !== 0) throw new Error("code=" + r.data.code + ": " + r.data.msg);
     return r.data.data?.content || "";
   } catch (e) {
-    if (e.response) throw new Error("DocAPI HTTP" + e.response.status + ": " + JSON.stringify(e.response.data).substring(0, 200));
+    if (e.response) throw new Error("DocHTTP" + e.response.status + ": " + JSON.stringify(e.response.data).substring(0, 150));
     throw e;
   }
 }
 
-async function fetchSheetContent(sheetToken) {
+// Read ALL sheets, up to maxSheets tabs, up to maxRows rows each
+async function fetchSheetContent(sheetToken, maxSheets = 10, maxRows = 500) {
   const token = await getLarkToken();
   console.log("[fetchSheet] token=" + sheetToken);
   try {
@@ -126,8 +127,8 @@ async function fetchSheetContent(sheetToken) {
     const sheets = meta.data.data?.sheets || [];
     if (sheets.length === 0) return "(Sheet trong - khong co du lieu)";
     const parts = [];
-    for (const sheet of sheets.slice(0, 3)) {
-      const range = sheet.sheet_id + "!A1:Z100";
+    for (const sheet of sheets.slice(0, maxSheets)) {
+      const range = sheet.sheet_id + "!A1:Z" + maxRows;
       try {
         const rv = await axios.get(
           LARK_BASE + "/sheets/v2/spreadsheets/" + sheetToken + "/values/" + range,
@@ -135,36 +136,63 @@ async function fetchSheetContent(sheetToken) {
         );
         if (rv.data.code !== 0) { console.log("[fetchSheet] val code=" + rv.data.code); continue; }
         const rows = rv.data.data?.valueRange?.values || [];
-        const text = rows.map(row => (row || []).filter(c => c !== null && c !== "").join("\t")).join("\n");
-        parts.push("=== " + sheet.title + " ===\n" + text);
+        const text = rows
+          .filter(row => row && row.some(c => c !== null && c !== ""))
+          .map(row => (row || []).map(c => c === null ? "" : String(c)).join("\t"))
+          .join("\n");
+        parts.push("=== Sheet: " + sheet.title + " (" + rows.length + " hang) ===\n" + text);
       } catch (ve) {
-        const vb = ve.response ? "HTTP" + ve.response.status + ": " + JSON.stringify(ve.response.data).substring(0,100) : ve.message;
-        parts.push("=== " + sheet.title + " === (loi: " + vb + ")");
+        const vb = ve.response ? "HTTP" + ve.response.status : ve.message;
+        parts.push("=== Sheet: " + sheet.title + " === (loi: " + vb + ")");
       }
+    }
+    if (sheets.length > maxSheets) {
+      parts.push("(Con " + (sheets.length - maxSheets) + " sheet khac chua doc)");
     }
     return parts.join("\n\n") || "(Sheet trong)";
   } catch (e) {
-    if (e.response) throw new Error("SheetAPI HTTP" + e.response.status + ": " + JSON.stringify(e.response.data).substring(0, 200));
+    if (e.response) throw new Error("SheetHTTP" + e.response.status + ": " + JSON.stringify(e.response.data).substring(0, 150));
     throw e;
   }
 }
 
-async function fetchWikiContent(wikiToken) {
+// For wiki-type: try wiki API first, fallback to direct sheet/doc API with same token
+async function fetchWikiOrFallback(wikiToken) {
   const token = await getLarkToken();
   console.log("[fetchWiki] token=" + wikiToken);
+
+  // Step 1: Try wiki API to get the underlying obj_token
   try {
     const r = await axios.get(LARK_BASE + "/wiki/v2/spaces/get_node?token=" + wikiToken,
       { headers: { Authorization: "Bearer " + token } });
-    if (r.data.code !== 0) throw new Error("code=" + r.data.code + ": " + r.data.msg);
-    const objToken = r.data.data?.node?.obj_token;
-    const objType = r.data.data?.node?.obj_type;
-    console.log("[fetchWiki] obj_token=" + objToken + " obj_type=" + objType);
-    if (!objToken) throw new Error("no obj_token in wiki node");
-    if (objType === "sheet" || objType === "bitable") return fetchSheetContent(objToken);
-    return fetchDocContent(objToken);
+    if (r.data.code === 0) {
+      const objToken = r.data.data?.node?.obj_token;
+      const objType = r.data.data?.node?.obj_type;
+      console.log("[fetchWiki] resolved obj_token=" + objToken + " obj_type=" + objType);
+      if (!objToken) throw new Error("no obj_token");
+      if (objType === "sheet" || objType === "bitable") return await fetchSheetContent(objToken);
+      return await fetchDocContent(objToken);
+    }
+    console.log("[fetchWiki] wiki API code=" + r.data.code + ", trying direct fallback");
   } catch (e) {
-    if (e.response) throw new Error("WikiAPI HTTP" + e.response.status + ": " + JSON.stringify(e.response.data).substring(0, 200));
-    throw e;
+    console.log("[fetchWiki] wiki API failed: " + e.message + ", trying direct fallback");
+  }
+
+  // Step 2: Fallback - in Lark wiki, the page token is often the same as the spreadsheet token
+  // Try Sheets API directly with the wiki token
+  try {
+    console.log("[fetchWiki] trying sheets API directly with wiki token");
+    return await fetchSheetContent(wikiToken);
+  } catch (e2) {
+    console.log("[fetchWiki] sheets fallback failed: " + e2.message);
+  }
+
+  // Step 3: Try Docx API directly
+  try {
+    console.log("[fetchWiki] trying docx API directly with wiki token");
+    return await fetchDocContent(wikiToken);
+  } catch (e3) {
+    throw new Error("Wiki/Sheet/Doc all failed for token=" + wikiToken + ". Need wiki:wiki:readonly scope with user token access or share the doc with the bot.");
   }
 }
 
@@ -174,17 +202,18 @@ async function getDocContent(parsed) {
     console.log("[getDocContent] token=" + sharedToken + " docType=" + docType);
     try {
       if (docType === "sheet") return await fetchSheetContent(sharedToken);
-      if (docType === "wiki") return await fetchWikiContent(sharedToken);
+      if (docType === "bitable") return await fetchSheetContent(sharedToken);
+      if (docType === "wiki") return await fetchWikiOrFallback(sharedToken);
       return await fetchDocContent(sharedToken);
     } catch (e) {
-      throw new Error("READ_ERR|token=" + sharedToken + "|type=" + docType + "|raw=" + (rawPayload||"").substring(0,150) + "|err=" + e.message);
+      throw new Error("READ_ERR|token=" + sharedToken + "|type=" + docType + "|err=" + e.message);
     }
   }
   const resource = extractLarkResource(text, urls);
   if (resource) {
     try {
       if (resource.type === "sheet") return await fetchSheetContent(resource.token);
-      if (resource.type === "wiki") return await fetchWikiContent(resource.token);
+      if (resource.type === "wiki") return await fetchWikiOrFallback(resource.token);
       return await fetchDocContent(resource.token);
     } catch (e) {
       throw new Error("READ_ERR|token=" + resource.token + "|type=" + resource.type + "|err=" + e.message);
@@ -196,14 +225,17 @@ async function getDocContent(parsed) {
 async function askClaude(userMessage, history, docContent) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
-  let systemPrompt = "You are a helpful business assistant in Lark. Reply in the same language as the user (Vietnamese if they write Vietnamese). Be concise and professional.";
+  let systemPrompt = "You are a helpful business assistant in Lark for company SARA TOP SUN. Reply in Vietnamese unless the user writes in another language. Be concise and professional. When analyzing spreadsheet data, provide clear insights with numbers.";
   if (docContent) {
-    systemPrompt += "\n\nNoi dung tai lieu/bang tinh duoc chia se:\n\n" + docContent + "\n\nDung thong tin nay de tra loi chinh xac.";
+    // Truncate if too large (Claude context limit)
+    const maxLen = 30000;
+    const truncated = docContent.length > maxLen ? docContent.substring(0, maxLen) + "\n...(du lieu bi cat bo do qua dai)" : docContent;
+    systemPrompt += "\n\nDu lieu bang tinh/tai lieu duoc chia se:\n\n" + truncated + "\n\nDua vao du lieu nay de tra loi chinh xac.";
   }
   const messages = [...history, { role: "user", content: userMessage }];
   const r = await axios.post(ANTHROPIC_API,
-    { model: "claude-haiku-4-5-20251001", max_tokens: 1024, system: systemPrompt, messages },
-    { headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" }, timeout: 25000 }
+    { model: "claude-haiku-4-5-20251001", max_tokens: 1500, system: systemPrompt, messages },
+    { headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" }, timeout: 30000 }
   );
   return r.data.content[0].text;
 }
@@ -258,7 +290,7 @@ module.exports = async function handler(req, res) {
 
     try {
       const docContent = await getDocContent(parsed);
-      const question = userText || "Hay tom tat noi dung tai lieu nay.";
+      const question = userText || "Hay tom tat va phan tich noi dung tai lieu nay.";
       const reply = await askClaude(question, history, docContent);
       history.push({ role: "user", content: question }, { role: "assistant", content: reply });
       if (history.length > MAX_HISTORY * 2) conversationHistory[userId] = history.slice(-MAX_HISTORY * 2);
@@ -267,7 +299,7 @@ module.exports = async function handler(req, res) {
       if (err.message.startsWith("READ_ERR|")) {
         await sendText(chatId, "[DEBUG]\n" + err.message.replace(/\|/g, "\n")).catch(() => {});
       } else {
-        const detail = err.response ? "HTTP" + err.response.status + ": " + JSON.stringify(err.response.data).substring(0,200) : err.message;
+        const detail = err.response ? "HTTP" + err.response.status + ": " + JSON.stringify(err.response.data).substring(0, 200) : err.message;
         await sendText(chatId, "Loi: " + detail).catch(() => {});
       }
     }
@@ -291,7 +323,7 @@ module.exports = async function handler(req, res) {
       if (history.length > MAX_HISTORY * 2) conversationHistory[userId] = history.slice(-MAX_HISTORY * 2);
       await sendText(chatId, reply);
     } catch (err) {
-      const detail = err.response ? "HTTP" + err.response.status + ": " + JSON.stringify(err.response.data).substring(0,150) : err.message;
+      const detail = err.response ? "HTTP" + err.response.status + ": " + JSON.stringify(err.response.data).substring(0, 150) : err.message;
       await sendText(chatId, "Loi: " + detail).catch(() => {});
     }
   }
